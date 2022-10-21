@@ -15,12 +15,13 @@ async fn main() -> Result<(), irc::error::Error> {
         ..Config::default()
     };
 
-    let handler = MessageHandler::new(
+    let mut handler = MessageHandler::new(
         env::var("IRC_HOOK_SEARCH_PATTERN").unwrap(),
-        false,
+        env::var("IRC_HOOK_MULTILINE").is_ok(),
         0,
         "".to_string(),
         "".to_string(),
+        WebhookPublisher::new(),
     );
 
     let mut client = Client::from_config(irc_config).await?;
@@ -61,6 +62,8 @@ struct MessageHandler {
     line_limit: i32,
     line_init_pattern: String,
     line_conclude_pattern: String,
+    // TODO: Use a generic type here instead of a trait object?
+    message_publisher: WebhookPublisher,
 }
 
 impl MessageHandler {
@@ -70,6 +73,7 @@ impl MessageHandler {
         line_limit: i32,
         line_init_pattern: String,
         line_conclude_pattern: String,
+        message_publisher: WebhookPublisher,
     ) -> Self {
         MessageHandler {
             search_pattern,
@@ -77,29 +81,47 @@ impl MessageHandler {
             line_limit,
             line_init_pattern,
             line_conclude_pattern,
+            message_publisher,
         }
     }
 
-    fn handle_msg(&self, msg: Message) -> Vec<String> {
-        let mut out = vec![];
-
+    fn handle_msg(&mut self, msg: Message) {
         if let Some(content) = get_content(&msg.to_string()) {
+            print!("-- {}", content);
+
             let re = Regex::new(&self.search_pattern).unwrap();
 
             if re.is_match(&content) {
-                re.captures_iter(&content).for_each(|cap| {
-                    cap.iter().for_each(|mat| {
-                        if let Some(mat) = mat {
-                            out.push(mat.as_str().to_string())
-                        }
-                    });
+                re.captures_iter(&content).for_each(|group| {
+                    let captures: Vec<&str> = group
+                        .iter()
+                        .map(|mat| {
+                            if let Some(mat) = mat {
+                                return mat.as_str();
+                            } else {
+                                return "";
+                            }
+                        })
+                        .collect();
+
+                    self.message_publisher.publish(&captures);
                 })
             }
-
-            print!("{}", content);
         }
+    }
+}
 
-        out
+struct WebhookPublisher {
+    // TODO...
+}
+
+impl WebhookPublisher {
+    fn new() -> Self {
+        WebhookPublisher {}
+    }
+
+    fn publish(&mut self, captures: &[&str]) {
+        captures.iter().for_each(|cap| println!("{}", cap))
     }
 }
 
@@ -125,19 +147,5 @@ mod tests {
             get_content(&input),
             Some("Hello this is a message".to_string())
         );
-    }
-
-    #[test]
-    fn test_handle_msg() {
-        let content = r#"Main message 1capture match2"#;
-        let search_pattern = r#"\d(.+)\d"#.to_string();
-
-        let handler = MessageHandler::new(search_pattern, false, 0, "".to_string(), "".to_string());
-
-        let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
-
-        let got = handler.handle_msg(msg);
-
-        assert_eq!(got, vec!["1capture match2", "capture match"])
     }
 }
