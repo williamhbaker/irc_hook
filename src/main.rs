@@ -1,5 +1,6 @@
 use futures::prelude::*;
 use irc::client::prelude::*;
+use regex::Regex;
 use std::env;
 
 #[tokio::main]
@@ -14,13 +15,21 @@ async fn main() -> Result<(), irc::error::Error> {
         ..Config::default()
     };
 
+    let handler = MessageHandler::new(
+        env::var("IRC_HOOK_SEARCH_PATTERN").unwrap(),
+        false,
+        0,
+        "".to_string(),
+        "".to_string(),
+    );
+
     let mut client = Client::from_config(irc_config).await?;
     client.identify()?;
 
     let mut stream = client.stream()?;
 
     while let Some(message) = stream.next().await.transpose()? {
-        handle_msg(message);
+        handler.handle_msg(message);
     }
 
     Ok(())
@@ -46,9 +55,51 @@ impl ResolvedConfig {
     }
 }
 
-fn handle_msg(msg: Message) {
-    if let Some(content) = get_content(&msg.to_string()) {
-        print!("{}", content)
+struct MessageHandler {
+    search_pattern: String,
+    multi_line: bool,
+    line_limit: i32,
+    line_init_pattern: String,
+    line_conclude_pattern: String,
+}
+
+impl MessageHandler {
+    fn new(
+        search_pattern: String,
+        multi_line: bool,
+        line_limit: i32,
+        line_init_pattern: String,
+        line_conclude_pattern: String,
+    ) -> Self {
+        MessageHandler {
+            search_pattern,
+            multi_line,
+            line_limit,
+            line_init_pattern,
+            line_conclude_pattern,
+        }
+    }
+
+    fn handle_msg(&self, msg: Message) -> Vec<String> {
+        let mut out = vec![];
+
+        if let Some(content) = get_content(&msg.to_string()) {
+            let re = Regex::new(&self.search_pattern).unwrap();
+
+            if re.is_match(&content) {
+                re.captures_iter(&content).for_each(|cap| {
+                    cap.iter().for_each(|mat| {
+                        if let Some(mat) = mat {
+                            out.push(mat.as_str().to_string())
+                        }
+                    });
+                })
+            }
+
+            print!("{}", content);
+        }
+
+        out
     }
 }
 
@@ -74,5 +125,19 @@ mod tests {
             get_content(&input),
             Some("Hello this is a message".to_string())
         );
+    }
+
+    #[test]
+    fn test_handle_msg() {
+        let content = r#"Main message 1capture match2"#;
+        let search_pattern = r#"\d(.+)\d"#.to_string();
+
+        let handler = MessageHandler::new(search_pattern, false, 0, "".to_string(), "".to_string());
+
+        let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
+
+        let got = handler.handle_msg(msg);
+
+        assert_eq!(got, vec!["1capture match2", "capture match"])
     }
 }
