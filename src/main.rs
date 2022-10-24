@@ -2,6 +2,7 @@ use futures::prelude::*;
 use irc::client::prelude::*;
 use regex::Regex;
 use std::env;
+use tokio::task;
 
 #[tokio::main]
 async fn main() -> Result<(), irc::error::Error> {
@@ -30,7 +31,7 @@ async fn main() -> Result<(), irc::error::Error> {
     let mut stream = client.stream()?;
 
     while let Some(message) = stream.next().await.transpose()? {
-        handler.handle_msg(message);
+        handler.handle_msg(message).await;
     }
 
     Ok(())
@@ -85,34 +86,34 @@ impl MessageHandler {
         }
     }
 
-    fn handle_msg(&mut self, msg: Message) {
+    async fn handle_msg(&mut self, msg: Message) {
         if let Some(content) = get_content(&msg.to_string()) {
-            print!("-- {}", content);
+            print!("-- {}", content); // TODO: Delete.
 
             let re = Regex::new(&self.search_pattern).unwrap();
-
-            if re.is_match(&content) {
-                re.captures_iter(&content).for_each(|group| {
-                    let captures: Vec<&str> = group
-                        .iter()
-                        .map(|mat| {
-                            if let Some(mat) = mat {
-                                return mat.as_str();
-                            } else {
-                                return "";
-                            }
-                        })
-                        .collect();
-
-                    self.message_publisher.publish(&captures);
-                })
+            if !re.is_match(&content) {
+                return;
             }
+
+            let groups = match_groups(&re, &content);
+            self.message_publisher.publish(groups).await;
         }
     }
 }
 
+fn match_groups(re: &regex::Regex, content: &str) -> Vec<Vec<String>> {
+    re.captures_iter(content)
+        .map(|group| {
+            group
+                .iter()
+                .filter_map(|mat| Some(mat?.as_str().to_string()))
+                .collect()
+        })
+        .collect()
+}
+
 struct WebhookPublisher {
-    // TODO...
+    // TODO...endpoints, templates, & other config.
 }
 
 impl WebhookPublisher {
@@ -120,8 +121,19 @@ impl WebhookPublisher {
         WebhookPublisher {}
     }
 
-    fn publish(&mut self, captures: &[&str]) {
-        captures.iter().for_each(|cap| println!("{}", cap))
+    async fn publish(&self, params: Vec<Vec<String>>) {
+        let tasks = params
+            .into_iter()
+            .map(|p_set| {
+                task::spawn(async move {
+                    println!("{:#?}", p_set);
+                    reqwest::get("https://httpbin.org/ip").await // TODO
+                })
+            })
+            .collect::<stream::FuturesUnordered<_>>();
+
+        let result = futures::future::join_all(tasks).await;
+        println!("{:?}", result);
     }
 }
 
@@ -147,5 +159,23 @@ mod tests {
             get_content(&input),
             Some("Hello this is a message".to_string())
         );
+    }
+
+    #[test]
+    fn test_match_groups() {
+        let content = r#"Main message 1capture match2 text 1another match2"#;
+
+        let search_pattern = r#"\d(.+?)\d"#;
+        let re = Regex::new(&search_pattern).unwrap();
+
+        let got = match_groups(&re, content);
+
+        assert_eq!(
+            got,
+            vec![
+                vec!["1capture match2".to_string(), "capture match".to_string()],
+                vec!["1another match2".to_string(), "another match".to_string()]
+            ]
+        )
     }
 }
