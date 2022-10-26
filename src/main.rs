@@ -20,13 +20,13 @@ async fn main() -> Result<(), irc::error::Error> {
 
     let publisher = WebhookPublisher::new(uri, env::var("IRC_HOOK_WEBHOOK_API_KEY").unwrap());
 
-    let handler = MessageHandler::new(
+    let mut handler = MessageHandler::new(
         env::var("IRC_HOOK_SEARCH_PATTERN").unwrap(),
         env::var("IRC_HOOK_MULTILINE").is_ok(),
-        0,
+        4,
+        env::var("IRC_HOOK_LINE_INIT_PATTERN").unwrap(),
         "".to_string(),
-        "".to_string(),
-        &publisher,
+        publisher,
     );
 
     let mut client = Client::from_config(irc_config).await?;
@@ -61,24 +61,25 @@ impl ResolvedConfig {
     }
 }
 
-struct MessageHandler<'a> {
+struct MessageHandler {
     search_pattern: String,
     multi_line: bool,
     line_limit: i32,
     line_init_pattern: String,
     line_conclude_pattern: String,
-    // TODO: Use a generic type here instead of a trait object?
-    message_publisher: &'a WebhookPublisher,
+    message_publisher: WebhookPublisher,
+
+    lines_buffer: Vec<String>,
 }
 
-impl<'a> MessageHandler<'a> {
+impl MessageHandler {
     fn new(
         search_pattern: String,
         multi_line: bool,
         line_limit: i32,
         line_init_pattern: String,
         line_conclude_pattern: String,
-        message_publisher: &'a WebhookPublisher,
+        message_publisher: WebhookPublisher,
     ) -> Self {
         MessageHandler {
             search_pattern,
@@ -87,20 +88,53 @@ impl<'a> MessageHandler<'a> {
             line_init_pattern,
             line_conclude_pattern,
             message_publisher,
+            lines_buffer: vec![],
         }
     }
 
-    async fn handle_msg(&self, msg: Message) {
+    async fn handle_msg(&mut self, msg: Message) {
         if let Some(content) = get_content(&msg.to_string()) {
             print!("-- {}", content); // TODO: Delete.
-
             let re = Regex::new(&self.search_pattern).unwrap();
-            if !re.is_match(&content) {
-                return;
-            }
+            let init = Regex::new(&self.line_init_pattern).unwrap();
+            let finish = Regex::new(&self.line_conclude_pattern).unwrap();
 
-            let groups = match_groups(&re, &content);
-            self.message_publisher.publish(groups).await;
+            if !self.multi_line {
+                if !re.is_match(&content) {
+                    return;
+                }
+
+                let groups = match_groups(&re, &content);
+                self.message_publisher.publish(groups).await;
+            } else {
+                // When we match the line init, start accumulating lines until the line conclude OR
+                // the line limit is reached
+                if self.lines_buffer.len() == 0 {
+                    // Looking for the start of a new multi-line match candidate.
+                    if init.is_match(&content) {
+                        self.lines_buffer.push(content)
+                    }
+
+                    // Maybe the line limit is just 1? Don't worry about that right now.
+
+                    return;
+                } else {
+                    // We already have stuff in the buffer.
+
+                    // Put more in.
+                    self.lines_buffer.push(content.clone());
+
+                    // Is it enough? Or did we match an ending line?
+                    if self.lines_buffer.len() == self.line_limit as usize
+                        || finish.is_match(&content)
+                    {
+                        let total = self.lines_buffer.join(" ");
+                        self.lines_buffer = vec![];
+                        let groups = match_groups(&re, &total);
+                        self.message_publisher.publish(groups).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -208,7 +242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handler() {
+    async fn test_handler_not_multi_line() {
         let content = r#"Main message 1capture match2 text 1another match2"#;
         let search_pattern = r#"\d(.+?)\d"#;
 
@@ -221,17 +255,91 @@ mod tests {
         let uri = server.url("/endpoint");
 
         let publisher = WebhookPublisher::new(uri, "".to_string());
-        let handler = MessageHandler::new(
+        let mut handler = MessageHandler::new(
             search_pattern.to_string(),
             false,
             0,
             "".to_string(),
             "".to_string(),
-            &publisher,
+            publisher,
         );
 
         let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
 
         handler.handle_msg(msg).await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_multi_line() {
+        let contents = vec![
+            r#"something irrelevant"#,
+            r#"**STARTED** more words"#,
+            r#"Main message 1capture match2 text"#,
+            r#"No matches here"#,
+            r#"Another message 1another match match2 more stuff"#,
+            r#"something else irrelevant"#,
+        ];
+
+        let search_pattern = r#"\d(.+?)\d"#;
+
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/endpoint"))
+                .times(2)
+                .respond_with(status_code(200)),
+        );
+        let uri = server.url("/endpoint");
+
+        let publisher = WebhookPublisher::new(uri, "".to_string());
+        let mut handler = MessageHandler::new(
+            search_pattern.to_string(),
+            true,
+            4,
+            r#"\*\*STARTED\*\*"#.to_string(),
+            r#"\*\*FINISHED\*\*"#.to_string(),
+            publisher,
+        );
+
+        for content in contents.iter() {
+            let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
+            handler.handle_msg(msg).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_multi_line_ending() {
+        let contents = vec![
+            r#"something irrelevant"#,
+            r#"**STARTED** more words"#,
+            r#"Main message 1capture match2 text"#,
+            r#"**FINISHED** more words"#,
+            r#"Another message 1another match match2 more stuff"#,
+            r#"something else irrelevant"#,
+        ];
+
+        let search_pattern = r#"\d(.+?)\d"#;
+
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/endpoint"))
+                .times(1)
+                .respond_with(status_code(200)),
+        );
+        let uri = server.url("/endpoint");
+
+        let publisher = WebhookPublisher::new(uri, "".to_string());
+        let mut handler = MessageHandler::new(
+            search_pattern.to_string(),
+            true,
+            4,
+            r#"\*\*STARTED\*\*"#.to_string(),
+            r#"\*\*FINISHED\*\*"#.to_string(),
+            publisher,
+        );
+
+        for content in contents.iter() {
+            let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
+            handler.handle_msg(msg).await;
+        }
     }
 }
