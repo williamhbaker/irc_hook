@@ -1,7 +1,7 @@
 use futures::prelude::*;
 use irc::client::prelude::*;
 use regex::Regex;
-use std::env;
+use std::{env, sync::Arc};
 use tokio::task;
 
 #[tokio::main]
@@ -16,13 +16,15 @@ async fn main() -> Result<(), irc::error::Error> {
         ..Config::default()
     };
 
-    let mut handler = MessageHandler::new(
+    let publisher = WebhookPublisher::new(Arc::from("tbd"));
+
+    let handler = MessageHandler::new(
         env::var("IRC_HOOK_SEARCH_PATTERN").unwrap(),
         env::var("IRC_HOOK_MULTILINE").is_ok(),
         0,
         "".to_string(),
         "".to_string(),
-        WebhookPublisher::new(),
+        &publisher,
     );
 
     let mut client = Client::from_config(irc_config).await?;
@@ -57,24 +59,24 @@ impl ResolvedConfig {
     }
 }
 
-struct MessageHandler {
+struct MessageHandler<'a> {
     search_pattern: String,
     multi_line: bool,
     line_limit: i32,
     line_init_pattern: String,
     line_conclude_pattern: String,
     // TODO: Use a generic type here instead of a trait object?
-    message_publisher: WebhookPublisher,
+    message_publisher: &'a WebhookPublisher,
 }
 
-impl MessageHandler {
+impl<'a> MessageHandler<'a> {
     fn new(
         search_pattern: String,
         multi_line: bool,
         line_limit: i32,
         line_init_pattern: String,
         line_conclude_pattern: String,
-        message_publisher: WebhookPublisher,
+        message_publisher: &'a WebhookPublisher,
     ) -> Self {
         MessageHandler {
             search_pattern,
@@ -86,7 +88,7 @@ impl MessageHandler {
         }
     }
 
-    async fn handle_msg(&mut self, msg: Message) {
+    async fn handle_msg(&self, msg: Message) {
         if let Some(content) = get_content(&msg.to_string()) {
             print!("-- {}", content); // TODO: Delete.
 
@@ -112,22 +114,27 @@ fn match_groups(re: &regex::Regex, content: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+#[derive(Debug)]
 struct WebhookPublisher {
-    // TODO...endpoints, templates, & other config.
+    endpoint: Arc<str>,
 }
 
 impl WebhookPublisher {
-    fn new() -> Self {
-        WebhookPublisher {}
+    fn new(endpoint: Arc<str>) -> Self {
+        WebhookPublisher { endpoint }
     }
 
     async fn publish(&self, params: Vec<Vec<String>>) {
         let tasks = params
             .into_iter()
             .map(|p_set| {
-                task::spawn(async move {
-                    println!("{:#?}", p_set);
-                    reqwest::get("https://httpbin.org/ip").await // TODO
+                task::spawn({
+                    let ep = Arc::clone(&self.endpoint);
+                    async move {
+                        println!("{:#?}", p_set);
+                        let addr = ep.to_string();
+                        reqwest::get(addr).await // TODO
+                    }
                 })
             })
             .collect::<stream::FuturesUnordered<_>>();
@@ -151,6 +158,7 @@ fn get_content(m: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httptest::{matchers::*, responders::*, Expectation, Server};
 
     #[test]
     fn test_get_content() {
@@ -177,5 +185,33 @@ mod tests {
                 vec!["1another match2".to_string(), "another match".to_string()]
             ]
         )
+    }
+
+    #[tokio::test]
+    async fn test_handler() {
+        let content = r#"Main message 1capture match2 text 1another match2"#;
+        let search_pattern = r#"\d(.+?)\d"#;
+
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("GET", "/endpoint"))
+                .times(2)
+                .respond_with(status_code(200)),
+        );
+        let url = server.url_str("/endpoint");
+
+        let publisher = WebhookPublisher::new(Arc::from(url.to_string()));
+        let handler = MessageHandler::new(
+            search_pattern.to_string(),
+            false,
+            0,
+            "".to_string(),
+            "".to_string(),
+            &publisher,
+        );
+
+        let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
+
+        handler.handle_msg(msg).await;
     }
 }
