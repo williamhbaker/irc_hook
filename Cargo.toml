@@ -8,7 +8,8 @@ regex = "1.6.0"
 irc = "0.15.0"
 tokio = { version = "1.21.2", features = ["full"] }
 futures = "0.3.24"
-reqwest = { version = "0.11", features = [] }
+reqwest = { version = "0.11", features = ["json"] }
+http = "0.2.8"
 
 [dev-dependencies]
 tokio-test = "0.4.2"

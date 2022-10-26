@@ -1,7 +1,7 @@
 use futures::prelude::*;
 use irc::client::prelude::*;
 use regex::Regex;
-use std::{env, sync::Arc};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 use tokio::task;
 
 #[tokio::main]
@@ -16,7 +16,9 @@ async fn main() -> Result<(), irc::error::Error> {
         ..Config::default()
     };
 
-    let publisher = WebhookPublisher::new(Arc::from("tbd"));
+    let uri = http::Uri::from_str(&env::var("IRC_HOOK_WEBHOOK_URL").unwrap()).unwrap();
+
+    let publisher = WebhookPublisher::new(uri, env::var("IRC_HOOK_WEBHOOK_API_KEY").unwrap());
 
     let handler = MessageHandler::new(
         env::var("IRC_HOOK_SEARCH_PATTERN").unwrap(),
@@ -116,24 +118,42 @@ fn match_groups(re: &regex::Regex, content: &str) -> Vec<Vec<String>> {
 
 #[derive(Debug)]
 struct WebhookPublisher {
-    endpoint: Arc<str>,
+    endpoint: http::Uri,
+    api_key: String,
 }
 
 impl WebhookPublisher {
-    fn new(endpoint: Arc<str>) -> Self {
-        WebhookPublisher { endpoint }
+    fn new(endpoint: http::Uri, api_key: String) -> Self {
+        WebhookPublisher { endpoint, api_key }
     }
 
     async fn publish(&self, params: Vec<Vec<String>>) {
+        let ep = Arc::new(self.endpoint.to_string());
+        let key = Arc::new(self.api_key.clone());
+
         let tasks = params
             .into_iter()
             .map(|p_set| {
                 task::spawn({
-                    let ep = Arc::clone(&self.endpoint);
+                    let epc = Arc::clone(&ep);
+                    let keyc = Arc::clone(&key);
+
                     async move {
                         println!("{:#?}", p_set);
-                        let addr = ep.to_string();
-                        reqwest::get(addr).await // TODO
+
+                        let mut map = HashMap::new();
+                        map.insert("lang", "rust");
+                        map.insert("body", "json");
+
+                        let client = reqwest::Client::new();
+                        let res = client
+                            .post(epc.as_str())
+                            .header("X-Api-Key", keyc.to_string())
+                            .json(&map)
+                            .send()
+                            .await;
+
+                        println!("{:#?}", res);
                     }
                 })
             })
@@ -194,13 +214,13 @@ mod tests {
 
         let server = Server::run();
         server.expect(
-            Expectation::matching(request::method_path("GET", "/endpoint"))
+            Expectation::matching(request::method_path("POST", "/endpoint"))
                 .times(2)
                 .respond_with(status_code(200)),
         );
-        let url = server.url_str("/endpoint");
+        let uri = server.url("/endpoint");
 
-        let publisher = WebhookPublisher::new(Arc::from(url.to_string()));
+        let publisher = WebhookPublisher::new(uri, "".to_string());
         let handler = MessageHandler::new(
             search_pattern.to_string(),
             false,
