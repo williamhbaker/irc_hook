@@ -3,9 +3,17 @@ use irc::client::prelude::*;
 use regex::Regex;
 use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 use tokio::task;
+use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), irc::error::Error> {
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing::info!("starting irc_hook");
+
     let resolved_config = ResolvedConfig::build().unwrap();
 
     let irc_config = Config {
@@ -18,11 +26,15 @@ async fn main() -> Result<(), irc::error::Error> {
 
     let uri = http::Uri::from_str(&env::var("IRC_HOOK_WEBHOOK_URL").unwrap()).unwrap();
 
-    let publisher = WebhookPublisher::new(uri, env::var("IRC_HOOK_WEBHOOK_API_KEY").unwrap());
+    let publisher = WebhookPublisher::new(
+        uri,
+        env::var("IRC_HOOK_WEBHOOK_API_KEY").unwrap(),
+        env::var("IRC_HOOK_BODY_TEMPLATE").unwrap(),
+    );
 
     let mut handler = MessageHandler::new(
         env::var("IRC_HOOK_SEARCH_PATTERN").unwrap(),
-        env::var("IRC_HOOK_MULTILINE").is_ok(),
+        env::var("IRC_HOOK_MULTI_LINE").is_ok(),
         4,
         env::var("IRC_HOOK_LINE_INIT_PATTERN").unwrap(),
         "".to_string(),
@@ -81,6 +93,8 @@ impl MessageHandler {
         line_conclude_pattern: String,
         message_publisher: WebhookPublisher,
     ) -> Self {
+        tracing::info!(%line_init_pattern, "starting handler with line init pattern");
+
         MessageHandler {
             search_pattern,
             multi_line,
@@ -94,43 +108,48 @@ impl MessageHandler {
 
     async fn handle_msg(&mut self, msg: Message) {
         if let Some(content) = get_content(&msg.to_string()) {
-            print!("-- {}", content); // TODO: Delete.
             let re = Regex::new(&self.search_pattern).unwrap();
             let init = Regex::new(&self.line_init_pattern).unwrap();
             let finish = Regex::new(&self.line_conclude_pattern).unwrap();
 
             if !self.multi_line {
                 if !re.is_match(&content) {
+                    tracing::debug!(%content, "single-line mode did not match");
                     return;
                 }
+                tracing::info!(%content, "single-line mode match");
 
                 let groups = match_groups(&re, &content);
                 self.message_publisher.publish(groups).await;
             } else {
-                // When we match the line init, start accumulating lines until the line conclude OR
-                // the line limit is reached
                 if self.lines_buffer.len() == 0 {
-                    // Looking for the start of a new multi-line match candidate.
                     if init.is_match(&content) {
+                        tracing::info!(matched = %content, "starting new multi-line match");
                         self.lines_buffer.push(content)
+                    } else {
+                        tracing::debug!(content = %content, matcher = %self.line_init_pattern, "multi-line mode did not match for init");
                     }
 
-                    // Maybe the line limit is just 1? Don't worry about that right now.
+                    // TODO: Handle line limit of 1
 
                     return;
                 } else {
-                    // We already have stuff in the buffer.
+                    tracing::info!(added = %content, "adding to in-progress multi-line match");
 
-                    // Put more in.
                     self.lines_buffer.push(content.clone());
 
-                    // Is it enough? Or did we match an ending line?
                     if self.lines_buffer.len() == self.line_limit as usize
-                        || finish.is_match(&content)
+                        || self.line_conclude_pattern != "".to_string() && finish.is_match(&content)
                     {
+                        tracing::info!(finished_line = %content, "concluded multi-line match");
+
                         let total = self.lines_buffer.join(" ");
+                        tracing::info!(candidate = %total, "will match on combined result");
+
                         self.lines_buffer = vec![];
+
                         let groups = match_groups(&re, &total);
+                        tracing::info!(?groups, "matched groups");
                         self.message_publisher.publish(groups).await;
                     }
                 }
@@ -154,26 +173,37 @@ fn match_groups(re: &regex::Regex, content: &str) -> Vec<Vec<String>> {
 struct WebhookPublisher {
     endpoint: http::Uri,
     api_key: String,
+    template: String,
 }
 
 impl WebhookPublisher {
-    fn new(endpoint: http::Uri, api_key: String) -> Self {
-        WebhookPublisher { endpoint, api_key }
+    fn new(endpoint: http::Uri, api_key: String, template: String) -> Self {
+        WebhookPublisher {
+            endpoint,
+            api_key,
+            template,
+        }
     }
 
     async fn publish(&self, params: Vec<Vec<String>>) {
         let ep = Arc::new(self.endpoint.to_string());
         let key = Arc::new(self.api_key.clone());
+        let template = Arc::new(self.template.clone());
 
         let tasks = params
             .into_iter()
             .map(|p_set| {
                 task::spawn({
-                    let epc = Arc::clone(&ep);
-                    let keyc = Arc::clone(&key);
+                    let ep_clone = Arc::clone(&ep);
+                    let key_clone = Arc::clone(&key);
+                    let template_clone = Arc::clone(&template);
 
                     async move {
                         println!("{:#?}", p_set);
+
+                        // Replace the items in the template with matches from the group.
+                        // let mut body_init = template_clone.clone();
+                        // p_set.iter().enumerate().fold(body_init, |body, next| {});
 
                         let mut map = HashMap::new();
                         map.insert("lang", "rust");
@@ -181,8 +211,8 @@ impl WebhookPublisher {
 
                         let client = reqwest::Client::new();
                         let res = client
-                            .post(epc.as_str())
-                            .header("X-Api-Key", keyc.to_string())
+                            .post(ep_clone.as_str())
+                            .header("X-Api-Key", key_clone.to_string())
                             .json(&map)
                             .send()
                             .await;
@@ -203,7 +233,8 @@ fn get_content(m: &str) -> Option<String> {
     let mut chrs = m.chars().skip(1);
 
     if let Some(_) = chrs.find(|&c| c == ':') {
-        Some(chrs.collect())
+        // Make sure the trailing newline is removed.
+        Some(chrs.collect::<String>().trim().to_string())
     } else {
         None
     }
@@ -254,7 +285,7 @@ mod tests {
         );
         let uri = server.url("/endpoint");
 
-        let publisher = WebhookPublisher::new(uri, "".to_string());
+        let publisher = WebhookPublisher::new(uri, "".to_string(), "".to_string());
         let mut handler = MessageHandler::new(
             search_pattern.to_string(),
             false,
@@ -290,13 +321,13 @@ mod tests {
         );
         let uri = server.url("/endpoint");
 
-        let publisher = WebhookPublisher::new(uri, "".to_string());
+        let publisher = WebhookPublisher::new(uri, "".to_string(), "".to_string());
         let mut handler = MessageHandler::new(
             search_pattern.to_string(),
             true,
             4,
             r#"\*\*STARTED\*\*"#.to_string(),
-            r#"\*\*FINISHED\*\*"#.to_string(),
+            "".to_string(),
             publisher,
         );
 
@@ -327,7 +358,7 @@ mod tests {
         );
         let uri = server.url("/endpoint");
 
-        let publisher = WebhookPublisher::new(uri, "".to_string());
+        let publisher = WebhookPublisher::new(uri, "".to_string(), "".to_string());
         let mut handler = MessageHandler::new(
             search_pattern.to_string(),
             true,
