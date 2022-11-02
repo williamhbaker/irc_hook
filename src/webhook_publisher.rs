@@ -28,14 +28,7 @@ impl WebhookPublisher {
 
     pub fn publish_group(&self, group: &[String]) -> task::JoinHandle<()> {
         tracing::debug!(group = ?group, "building POST body");
-        // Replace the items in the template with matches from the group.
-        let body = group
-            .iter()
-            .enumerate()
-            .fold(self.template.clone(), |body, (idx, repl)| {
-                let idx_thing = format!("${{{}}}", idx);
-                body.replace(&idx_thing, repl)
-            });
+        let body = templ_replace(&self.template, group);
         tracing::debug!(body = body);
 
         let join = task::spawn({
@@ -60,4 +53,14 @@ impl WebhookPublisher {
 
         return join;
     }
+}
+
+fn templ_replace(templ: &str, group: &[String]) -> String {
+    group
+        .iter()
+        .enumerate()
+        .fold(templ.to_string().clone(), |body, (idx, repl)| {
+            let repl_idx = format!("${{{}}}", idx);
+            body.replace(&repl_idx, repl)
+        })
 }
