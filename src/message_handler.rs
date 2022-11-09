@@ -59,7 +59,6 @@ fn match_groups(re: &regex::Regex, content: &str) -> Vec<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use httptest::{matchers::*, responders::*, Expectation, Server};
 
     #[test]
     fn test_get_content() {
@@ -86,27 +85,5 @@ mod tests {
                 vec!["1another match2".to_string(), "another match".to_string()]
             ]
         )
-    }
-
-    #[tokio::test]
-    async fn test_handler_() {
-        let content = r#"Main message 1capture match2 text 1another match2"#;
-        let search_pattern = r#"\d(.+?)\d"#;
-
-        let server = Server::run();
-        server.expect(
-            Expectation::matching(request::method_path("POST", "/endpoint"))
-                .times(2)
-                .respond_with(status_code(200)),
-        );
-        let uri = server.url("/endpoint");
-
-        let publisher =
-            webhook_publisher::WebhookPublisher::new(uri, "".to_string(), "".to_string());
-        let mut handler = MessageHandler::new(search_pattern, publisher);
-
-        let msg = Message::new(Some("user"), "PRIVMSG", vec!["#channel", content]).unwrap();
-
-        handler.handle_msg(msg).await;
     }
 }

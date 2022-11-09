@@ -1,52 +1,61 @@
-use std::sync::Arc;
+use http::HeaderMap;
+use std::{collections::HashMap, sync::Arc};
 use tokio::task;
 
 pub struct WebhookPublisher {
-    endpoint: Arc<http::Uri>,
-    api_key: Arc<String>,
+    client: Arc<reqwest::Client>,
+    config: Arc<EndpointConfig>,
     template: String,
+    headers: HashMap<&'static str, String>,
+}
+
+struct EndpointConfig {
+    endpoint: http::Uri,
 }
 
 impl WebhookPublisher {
-    pub fn new(endpoint: http::Uri, api_key: String, template: String) -> Self {
+    pub fn new(
+        endpoint: http::Uri,
+        template: String,
+        headers: HashMap<&'static str, String>,
+    ) -> Self {
         WebhookPublisher {
-            endpoint: Arc::new(endpoint),
-            api_key: Arc::new(api_key),
+            client: Arc::new(reqwest::Client::new()),
+            config: Arc::new(EndpointConfig { endpoint }),
             template,
+            headers,
         }
     }
 
     pub async fn publish(&self, matched_groups: Vec<Vec<String>>) {
         let tasks = matched_groups
             .iter()
-            .map(|g| self.publish_group(&g))
+            .map(|g| self.publish_group(g.to_vec()))
             .collect::<Vec<task::JoinHandle<()>>>();
 
         let result = futures::future::join_all(tasks).await;
-        println!("{:?}", result);
+        println!("{:?}", result); // TODO: Error propagation.
     }
 
-    pub fn publish_group(&self, group: &[String]) -> task::JoinHandle<()> {
-        tracing::debug!(group = ?group, "building POST body");
-        let body = templ_replace(&self.template, group);
-        tracing::debug!(body = body);
+    pub fn publish_group(&self, group: Vec<String>) -> task::JoinHandle<()> {
+        let body = templ_replace(&self.template, &group);
+        let headers = to_headers(&self.headers, &group);
+
+        let client = self.client.clone();
+        let config = self.config.clone();
 
         let join = task::spawn({
-            let endpoint = self.endpoint.clone();
-            let api_key = self.api_key.clone();
-
             async move {
-                let client = reqwest::Client::new();
                 let res = client
-                    .post(endpoint.to_string())
-                    .header("X-Api-Key", api_key.to_string())
-                    .header("Content-Type", "application/json")
+                    .post(config.endpoint.to_string())
                     .body(body)
+                    .headers(headers)
                     .send()
                     .await;
 
-                if let Err(e) = res {
-                    tracing::error!("webhook POST error: {}", e);
+                match res {
+                    Ok(r) => tracing::info!(post_response = ?r),
+                    Err(e) => tracing::error!("webhook POST error: {}", e),
                 }
             }
         });
@@ -62,5 +71,14 @@ fn templ_replace(templ: &str, group: &[String]) -> String {
         .fold(templ.to_string().clone(), |body, (idx, repl)| {
             let repl_idx = format!("${{{}}}", idx);
             body.replace(&repl_idx, repl)
+        })
+}
+
+fn to_headers(headers: &HashMap<&'static str, String>, group: &[String]) -> HeaderMap {
+    headers
+        .iter()
+        .fold(http::HeaderMap::new(), |mut accum, (&k, v)| {
+            accum.insert(k, templ_replace(v, group).parse().unwrap());
+            accum
         })
 }
